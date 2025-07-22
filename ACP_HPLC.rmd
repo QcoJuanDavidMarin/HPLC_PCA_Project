@@ -1,0 +1,911 @@
+---
+title: "PCA_HPLC"
+author: "Juan David Marin"
+date: "2025-07-18"
+output: html_document
+---
+
+```{r}
+knitr::opts_chunk$set(echo = T)
+knitr::opts_chunk$set(warning = F)
+knitr::opts_chunk$set(comment = '')
+knitr::opts_chunk$set(message=FALSE)
+knitr::opts_chunk$set(eval = T)
+```
+
+
+```{r}
+# Libraries
+library(ggplot2)
+library(plotly)
+library(signal)
+library(ggmagnify)
+library(dplyr)
+library(tidyr)
+library(ptw)
+library(gridExtra)
+library(zoo)
+library(psych)
+library(tibble)
+
+```
+
+*From Lab to Strategy: Chemometrics for Smarter Manufacturing Decisions*
+
+Imagine a company that invests time, money, and talent in developing an innovative product. Everything seems to be going well... until, months later, quality control tests reveal that some batches are not the same as the first ones. What changed? Did the process fail? Was a raw material altered? These questions create uncertainty not only in the lab but also in production, logistics, marketing, and in the perception of the final customer. This is where traditional chemical analysis alone is no longer enough.
+
+At the heart of this story is chromatographic analysis (HPLC), a key technique to evaluate product quality and performance in industries such as cosmetics, food, pharmaceuticals, and agriculture. However, when comparing multiple batches of the same product, subtle (or not so subtle) variations can arise: changes in peak shape, shifts in retention times, or small deviations that might go unnoticed… until they cause bigger issues. These changes can happen due to differences in sample preparation, pH, mobile phase composition, temperature, system flow, or even column wear. They may also result from poor manufacturing practices, incorrect raw material dosing, or procurement issues like buying non-equivalent ingredients.
+
+This is where chemometrics comes in as a powerful tool that goes beyond the technical aspect. Applying multivariate algorithms like Principal Component Analysis (PCA) helps to detect hidden patterns, identify outlier batches, anticipate process failures, and most importantly, make informed, data-driven decisions. No solo se trata de resolver un problema analítico: se trata de integrar ciencia de datos en el corazón del control de calidad, de automatizar procesos con R y de transformar datos complejos en información estratégica para toda la compañía.
+
+This approach not only improves laboratory accuracy and efficiency but also positions the company as an innovative organization, capable of anticipating challenges and adopting cutting-edge competitive tools. From production to management, from quality assurance to product development, everyone benefits when science and analytics work together. Applied chemometrics is not just a technical solution: it’s a competitive advantage that drives operational excellence and strengthens confidence in every batch that reaches the market.
+
+
+# Chromatographic data simulation
+
+To exemplify this kind of problem, I created an R function called croma() which simulates a chromatogram with multiple peaks, baseline noise, and the possibility of setting the retention time shift.
+
+The function allows us to:
+
+•	Set the number of signals (peaks)
+
+•	Adjust the noise intensity in baseline
+
+•	Generate variations in time retentions among peaks
+
+•	Define parameters such as peak high, peak width, run time
+
+
+```{r}
+croma <- function(time_run, numbers_signal, noise_level, wp,
+                  jitter_rt = FALSE, jitter_range = 0.1,
+                  tr_base = NULL, h_base = NULL, wp_base = NULL,
+                  plot = TRUE) {
+  
+  if (wp < 0.05 || wp > 0.3) {
+    wp <- runif(n = 1, min = 0.05, max = 0.3)
+    cat('The width peak should be between 0.05 and 0.3, so the wp chosen is:', wp, "\n")
+  }
+  
+  # Usar base si se da, si no generar aleatoriamente
+  tr <- if (is.null(tr_base)) sample(x = 1.0:time_run, size = numbers_signal, replace = FALSE) else tr_base
+  hight <- if (is.null(h_base)) runif(n = numbers_signal, min = 100, max = 1000) else h_base
+  width_peak <- if (is.null(wp_base)) runif(n = numbers_signal, min = 0.05, max = wp) else wp_base
+
+  # Jitter opcional
+  if (jitter_rt) {
+    tr <- tr + runif(numbers_signal, min = -jitter_range, max = jitter_range)
+    tr <- pmin(pmax(tr, 0), time_run)
+  }
+  
+  # Ruido
+  noise <- if (noise_level == 0) {
+    rnorm(n = 1000, mean = 0, sd = 0)
+  } else {
+    rnorm(n = 1000, mean = 1, sd = noise_level)
+  }
+
+  base_line <- seq(0, time_run, length.out = 1000)
+  Abs <- rep(0, length(base_line))
+  
+  for (i in 1:numbers_signal) {
+    Abs <- Abs + (dnorm(base_line, mean = tr[i], sd = width_peak[i]) * hight[i] + noise)
+  }
+  
+  data_chromatogram <- data.frame(TR = round(base_line, 2), Abs = round(Abs, 2))
+  if (plot) {
+    plot(x = data_chromatogram$TR, y = data_chromatogram$Abs, type = 'l',
+         xlab = 'Retention time', ylab = 'Aborbance', col = "maroon2")
+    axis(1, at = seq(0, time_run, by = 1))
+    grid()
+  } else {
+    return(data_chromatogram)
+  }
+}
+```
+
+Even though the generated data are simulated, they are designed to imitate real data obtained from HPLC laboratory analysis, including undesired variations among runs, which is useful to develop and validate analytical methods based on chemometrics.
+
+
+# SIMULATING MULTIPLE BATCHES
+Once the croma() function is defined, the next step is to simulate the dataset of samples with different batches but the same product. The purpose is to show a real laboratory analysis scenario, where different HPLC runs of products, formulations, or raw materials are analyzed.
+Five batches (A–E) are generated with five samples per batch, each of them with four signals or peaks. These peaks were designed with retention times, heights, and peak widths specific for each batch.
+
+•	Aleatoric variations like noise or jitter were introduced to:
+
+•	Instrumental noise in the baseline
+
+•	Retention time shifts due to chromatographic condition variations
+
+•	Subtle differences in peak shape and intensity
+
+
+
+```{r}
+# Creating Sample A
+number_of_signals <- 5
+set.seed(320)
+number_of_peak <- 4
+tr_A <- sample(1.5:10, size = number_of_peak) 
+h_A <- runif(number_of_peak, min = 200, max = 650) 
+wp_A <- runif(number_of_peak, min = 0.05, max = 0.06) 
+
+dataset_lot_A <- list()
+noise_val <- sample(seq(0,0.5, by = 0.01), size = 5, replace = FALSE)
+
+for(i in 1:number_of_signals){
+  dataset_lot_A[[i]] <- croma(
+    time_run = 10,
+    numbers_signal = number_of_peak,
+    noise_level = noise_val[i],
+    wp = max(wp_A),
+    jitter_rt = TRUE,
+    jitter_range = 0.2,
+    tr_base = tr_A, 
+    h_base = h_A, 
+    wp_base = wp_A, 
+    plot = FALSE
+  )
+  dataset_lot_A[[i]]$Sample <- paste0('SampleA_', i)
+  dataset_lot_A[[i]]$lot <- 'lot_A'
+}
+dataset_lot_A <- do.call(rbind, dataset_lot_A)
+
+
+# Creating Sample B
+set.seed(320)
+number_of_peak <- 4
+tr_B <- sample(1.5:10, size = number_of_peak) 
+h_B <- runif(number_of_peak,  min = 120, max = 580) 
+wp_B <- runif(number_of_peak,  min = 0.05, max = 0.06) 
+
+dataset_lot_B <- list()
+noise_val <- sample(seq(0,0.5, by = 0.01), size = 5, replace = FALSE)
+
+for(i in 1:number_of_signals){
+  dataset_lot_B[[i]] <- croma(
+    time_run = 10,
+    numbers_signal = number_of_peak,
+    noise_level = noise_val[i],
+    wp = max(wp_A),
+    jitter_rt = TRUE,
+    jitter_range = 0.15,
+    tr_base = tr_B, 
+    h_base = h_B, 
+    wp_base = wp_B,
+    plot = FALSE
+  )
+  dataset_lot_B[[i]]$Sample <- paste0('SampleB_', i)
+  dataset_lot_B[[i]]$lot <- 'lot_B'
+}
+dataset_lot_B <- do.call(rbind, dataset_lot_B)
+
+# Creating Sample C
+set.seed(320)
+number_of_peak <- 4
+tr_C <- sample(1.5:10, size = number_of_peak) 
+h_C <- runif(number_of_peak, min = 200, max = 650) 
+wp_C <- runif(number_of_peak,  min = 0.05, max = 0.06) 
+
+dataset_lot_C <- list()
+noise_val <- sample(seq(0,1, by = 0.01), size = 5, replace = FALSE)
+
+for(i in 1:number_of_signals){
+  dataset_lot_C[[i]] <- croma(
+    time_run = 10,
+    numbers_signal = number_of_peak,
+    noise_level = noise_val[i],
+    wp = max(wp_C),
+    jitter_rt = TRUE,
+    jitter_range = 0.1,
+    tr_base = tr_C, 
+    h_base = h_C, 
+    wp_base = wp_C, 
+    plot = FALSE
+  )
+  dataset_lot_C[[i]]$Sample <- paste0('SampleC_', i)
+  dataset_lot_C[[i]]$lot <- 'lot_C'
+}
+dataset_lot_C <- do.call(rbind, dataset_lot_C)
+
+# Creating Sample D
+set.seed(320)
+number_of_peak <- 4
+tr_D <- sample(1.5:10, size = number_of_peak) 
+h_D <- runif(number_of_peak, min = 200, max = 650)
+wp_D <- runif(number_of_peak,  min = 0.05, max = 0.06) 
+
+dataset_lot_D <- list()
+noise_val <- sample(seq(0.2,0.5, by = 0.01), size = 5, replace = FALSE)
+
+for(i in 1:number_of_signals){
+  dataset_lot_D[[i]] <- croma(
+    time_run = 10,
+    numbers_signal = number_of_peak,
+    noise_level = noise_val[i],
+    wp = max(wp_D),
+    jitter_rt = TRUE,
+    jitter_range = 0.22,
+    tr_base = tr_D, 
+    h_base = h_D, 
+    wp_base = wp_D, 
+    plot = FALSE
+  )
+  dataset_lot_D[[i]]$Sample <- paste0('SampleD_', i)
+  dataset_lot_D[[i]]$lot <- 'lot_D'
+}
+dataset_lot_D <- do.call(rbind, dataset_lot_D)
+
+# Creating Sample E
+set.seed(320)
+number_of_peak <- 4
+tr_E <- sample(1.5:10, size = number_of_peak) 
+h_E <- runif(number_of_peak, min = 120, max = 580)
+wp_E <- runif(number_of_peak,  min = 0.05, max = 0.06) 
+
+dataset_lot_E <- list()
+noise_val <- sample(seq(0,0.9, by = 0.01), size = 5, replace = FALSE)
+
+for(i in 1:number_of_signals){
+  dataset_lot_E[[i]] <- croma(
+    time_run = 10,
+    numbers_signal = number_of_peak,
+    noise_level = noise_val[i],
+    wp = max(wp_E),
+    jitter_rt = TRUE,
+    jitter_range = 0.12,
+    tr_base = tr_E, 
+    h_base = h_E, 
+    wp_base = wp_E, 
+    plot = FALSE
+  )
+  dataset_lot_E[[i]]$Sample <- paste0('SampleE_', i)
+  dataset_lot_E[[i]]$lot <- 'lot_E'
+}
+dataset_lot_E <- do.call(rbind, dataset_lot_E)
+
+
+```
+
+
+# Chromatogram visualizations
+
+The next graph shows the twenty-five overlapped chromatograms:
+
+•	All batches share a similar peak structure among them.
+
+•	Batches A, C, and D show similar behavior among them.
+
+•	Batches B and E show structural differences compared to the previous ones, which is rather important to evidence possible clusters or anomalies in multivariate analysis.
+
+•	The baseline noise is subtle but noticeable and will be corrected in the next steps.
+
+In the industry and daily real work, as I mentioned earlier, those variations are due to many factors (raw material differences, changes in equipment or method conditions, batches out of specifications, expected variability among runs).
+That’s why analyzing these chromatographic profiles and behaviors allows us not only to detect deviations, issues, or problems, but also to identify repetitive patterns, making processes easier and more optimized, reducing time and costs, and ensuring product quality.
+
+
+```{r fig.height=6, fig.width=10}
+chromaDF <- rbind(dataset_lot_A, dataset_lot_B, dataset_lot_C, dataset_lot_D,dataset_lot_E)
+
+p1 <- ggplot(data = chromaDF , aes(x = TR, y = Abs, colour = Sample)) +
+  geom_line(linewidth = 0.1) + 
+  ggtitle(label = 'Chromatogram of 4 compounds with noise') +
+  theme_minimal()
+ggplotly(p1)
+```
+
+**MOSTRAR EL RUIDO DE LA BASE LINEA AL ESCRIBIR EN  MEDIUM**
+
+
+# Smoothing chromatogram with sgolayfilt()
+
+To enhance the quality of chromatograms, I used the Savitzky-Golay (sgolayfilt) smoothing function. This is a common technique applied in spectroscopy and chromatography to remove noise without distorting the shape of the peaks.
+
+
+```{r fig.height=6, fig.width=10}
+chromaDF_split <- split(chromaDF, chromaDF$Sample)
+
+abs_corr <- lapply(chromaDF_split, function(df){
+  abs_vals <- signal::sgolayfilt(df$Abs, p = 4, n = 23)
+  df$Abs_smooth <- round(as.numeric(abs_vals),2)
+  return(df)
+})
+
+chromaCorDF <- do.call(rbind, abs_corr)
+
+p2 <- ggplot(data = chromaCorDF, aes(x = TR, y = Abs_smooth, colour = Sample)) +
+  geom_line(linewidth = 0.1) + 
+  ggtitle(label = 'Chromatogram of 4 compounds with reduced noise') +
+  theme_minimal()
+ggplotly(p2)
+
+```
+
+
+
+```{r fig.height=8, fig.width=15}
+from <- c(xmin = 3.5, xmax = 5.40, ymin = -25, ymax = 40)
+to <- c(0, 5 , 2200, 3500)
+
+gridExtra::grid.arrange((p1 + theme(legend.position = "none", panel.grid = element_blank()) +
+                           ggmagnify::geom_magnify(from = from, 
+                                                   to = to, shadow = F,axes = "xy",
+                                                   proj = "single",colour = "black", 
+                                                   linetype = 1)),
+                        (p2 + theme(legend.position = "none", panel.grid = element_blank()) +
+                           ggmagnify::geom_magnify(from = from, 
+                                                   to = to, shadow = F,axes = "xy",
+                                                   proj = "single",colour = "black", 
+                                                   linetype = 1)),
+                        ncol = 2) 
+```
+
+The comparison plot shows that the noise was significantly reduced by the previous procedure. This step is crucial to improve visualization and simplify further steps like alignment, normalization, or multivariate analysis.
+
+Also, it allows us to reduce interpretation errors caused by noise, improve the accuracy of compound quantification, and automate decision-making based on cleaned data.
+
+
+# Peak aligning function
+
+The next code corrects retention time deviations among different samples to facilitate more accurate comparisons.
+I used the ptw() function (Piecewise Time Warping) to align peaks at specific retention time windows, breaking down the chromatogram into as many peaks as it has.
+I created a function called align_pecks() that takes the first chromatogram as a reference, then applies smoothing and individual warping. Also, it allows us to compare graphically the before and after of a chromatogram.
+
+
+```{r}
+chromaCorDF_w <- chromaCorDF %>% 
+  select(-Abs) %>% 
+  pivot_wider(names_from = TR, values_from = Abs_smooth, names_prefix = 'Min_')
+
+
+align_pecks <- function(df, tri , trf, plot = F, sample_n = F){
+  if(typeof(tri)!='character'|typeof(trf)!='character'){
+    print('The TR must be a string') }
+  section <- df[,which(colnames(df) == tri):which(colnames(df) == trf)]
+  reference <- as.matrix(section[1,])
+  # return(list(section,reference))
+  aligned_df <- lapply(X = 2:nrow(section), FUN = function(i){
+    ptw(ref = reference, samp = as.matrix(section[i,]),
+        warp.type = "individual",      # Suaviza la deformación
+        smooth.param = 5e3,
+        optim.crit = "RMS",         # Usa correlación cruzada ponderada
+        init.coef = c(0, 1, 0)      # Pequeño ajuste inicial
+        )$warped.sample   
+  })
+  #aligned_df <- do.call(rbind,aligned_df)
+  aligned_df <- data.frame(do.call(rbind,aligned_df) )
+  
+  if(plot ==T){
+    plot(t(reference), type = 'l', xlab = 'TR', ylab ='Abs',
+         main = 'Plot Peaks aligned', 
+         sub = paste0('Compared sample: ', df[1:nrow(df),][sample_n,1])
+         )
+    lines(t(aligned_df[sample_n,]), type = 'l', col = 'red', lwd = 2)
+    lines(t(df[sample_n,which(colnames(df) == tri):which(colnames(df) == trf)]),type = 'h', col = 'blue')
+    legend('topleft', legend = c('Ref', 'Aligned', 'Bef_alig'), col = c('black','red','blue'),
+           title = 'Samples', pch = 20)
+    }
+  return(aligned_df)
+}
+
+
+```
+
+This approach not only improves data analysis, but also has a wide impact in real lab applications. In quality assurance, it helps to compare specific peaks between batches or formulations, increasing confidence in detecting impurities or variations. The automation of peak alignment reduces manual work and human errors. In production, it helps identify retention time shifts caused by changes in pH, temperature, or column condition, which improves process control. It also reduces costs by avoiding unnecessary reruns, saving solvents, machine time, and staff effort. Finally, this method supports compliance by generating reproducible chromatogram reports that make regulatory validation easier.
+
+```{r fig.height=11, fig.width=15}
+par(mfrow=c(2,2)) 
+section_1 <- align_pecks(df = chromaCorDF_w, tri = 'Min_0', 
+                         trf = 'Min_3', plot = T, sample_n = 14)
+section_2 <- align_pecks(df = chromaCorDF_w, tri = 'Min_3.01', 
+                         trf ='Min_6',  plot = T, sample_n = 14)
+section_3 <- align_pecks(df = chromaCorDF_w, tri = 'Min_6.01', 
+                         trf = 'Min_7', plot = T, sample_n = 14)
+section_4 <- align_pecks(df = chromaCorDF_w, tri = 'Min_7.01', 
+                         trf = 'Min_10', plot = T, sample_n = 14)
+par(mfrow=c(1,1)) 
+
+alignedDF <- cbind(section_1,section_2,section_3,section_4)
+chromaCorAligDF_w <- chromaCorDF_w
+
+chromaCorAligDF_w[2:nrow(chromaCorAligDF_w),3:ncol(chromaCorAligDF_w)] <- alignedDF
+```
+
+
+
+
+In the above graphs, we can see how the peak shifts were corrected by the function. We can notice how the signals looked before being aligned (blue bars) and after the procedure was applied. The black line represents the reference chromatogram, and the red line shows the aligned chromatogram.
+
+This code significantly improves the quality of chromatographic preprocessing, allowing robust comparative analysis. It is a corporate tool for any laboratory that works with complex mixture sample analysis, reducing errors and time, and improving operational efficiency.
+
+# Tackling NAs
+  
+After aligning the chromatograms, some missing values are generated by the process. This happens due to the deformation of the peaks to match the reference chromatogram—some points are moved out of the original range, leaving some spaces without data.
+
+
+```{r}
+cat('There are',sum(is.na(chromaCorAligDF_w)),'missing values')
+```
+
+To solve this problem, I applied linear interpolation with the na.approx() function, which computes the missing values by joining the neighboring points with a straight line. I mean, the missing values are calculated following the slope between the previous point and the next one.
+
+```{r}
+chromaCorAligDF_w[,3:ncol(chromaCorAligDF_w)] <- t(
+  apply(
+    X = chromaCorAligDF_w[,3:ncol(chromaCorAligDF_w)], 
+    MARGIN = 1, FUN = function(x){
+  x_interp <- zoo::na.approx(x, na.rm = F)
+  x_filled <- zoo::na.locf(x_interp, na.rm = F) 
+  x_filled <- zoo::na.locf(x_filled, fromLast = T) 
+  return(x_filled)
+}))
+
+```
+
+
+Whether the NA appears at the beginning or at the end (where there aren't two points to interpolate), it is handled using the na.locf() function, which fills the missing value with the last known one, either forward or backward.
+
+```{r}
+cat('After handling missing values there are',sum(is.na(chromaCorAligDF_w)), 'NAs')
+
+```
+
+With this procedure, I recover the matrix without missing values, ready for further analysis.
+
+
+```{r fig.height=6, fig.width=10}
+p3 <- chromaCorAligDF_w %>% 
+  gather(key = 'TR', value = 'Abs', 3:1002) %>% 
+  mutate(TR = as.double(gsub('Min_', '', TR))) %>% 
+  ggplot(aes(x = TR, y = Abs, colour = Sample)) +
+  geom_line(linewidth = 0.1) + 
+  theme_minimal()
+ggplotly(p3)
+```
+
+
+
+```{r fig.height=10, fig.width=15}
+gridExtra::grid.arrange(
+
+chromaCorDF %>% 
+  filter(TR >= 4.5 & TR < 6.4 & stringr::str_detect(Sample, 'SampleA|SampleC|SampleD')) %>% 
+  ggplot(aes(x = TR, y = Abs_smooth, colour = Sample)) +
+  geom_line(linewidth = 0.1) + 
+  ggtitle(label = 'Second signal reduced noise, batches A,C,D') +
+  theme_minimal() + theme(legend.position = "none", panel.grid = element_blank()),
+
+chromaCorAligDF_w %>% 
+  gather(key = 'TR', value = 'Abs_smooth', 3:1002) %>% 
+  mutate(TR = as.double(gsub('Min_', '', TR))) %>% 
+  filter(stringr::str_detect(Sample, 'SampleA|SampleC|SampleD') & TR >= 4.5 & TR < 6.4) %>% 
+  ggplot(aes(x = TR, y = Abs_smooth, colour = Sample)) +
+  geom_line(linewidth = 0.1) + 
+  ggtitle(label = 'Second signal aligned, batches A,C,D') +
+  theme_minimal() + theme(legend.position = "none", panel.grid = element_blank()),
+
+chromaCorDF %>% 
+  filter(TR >= 4.5 & TR < 6.4 & stringr::str_detect(Sample, 'SampleB|SampleE')) %>% 
+  ggplot(aes(x = TR, y = Abs_smooth, colour = Sample)) +
+  geom_line(linewidth = 0.1) + 
+  ggtitle(label = 'Second signal reduced noise, batches B,E') +
+  theme_minimal() + theme(legend.position = "none", panel.grid = element_blank()),
+
+chromaCorAligDF_w %>% 
+  gather(key = 'TR', value = 'Abs_smooth', 3:1002) %>% 
+  mutate(TR = as.double(gsub('Min_', '', TR))) %>% 
+  filter(stringr::str_detect(Sample, 'SampleB|SampleE') & TR >= 4.5 & TR < 6.4) %>% 
+  ggplot(aes(x = TR, y = Abs_smooth, colour = Sample)) +
+  geom_line(linewidth = 0.1) + 
+  ggtitle(label = 'Second signal aligned, batches B,E') +
+  theme_minimal() + theme(legend.position = "none", panel.grid = element_blank()),
+
+ ncol = 2, nrow = 2)
+
+```
+
+It’s great how we can align the chromatogram’s peaks to make comparisons easier and more accurate. This helps us detect differences between samples, even if they were slightly shifted. It improves the quality of the analysis and supports better decisions.
+
+
+# Discretization or binning
+
+In order to compare chromatograms in a more structured way, I divided each signal into sections according to its retention time: areas without peaks (flat sections) and areas with peaks. This segmentation was done using manually defined time intervals. Then, the area under the curve was calculated for each segment using the trapezoid formula. This step converts the signals so they can be compared to each other, facilitating statistical analysis, automated quality control, and deviation detection among batches.
+
+```{r}
+spectrum_acp <- chromaCorAligDF_w %>% 
+  gather(key = 'TR', value = 'Abs', 3:1002) %>% 
+  mutate(TR = as.double(gsub('Min_', '', TR))) %>% 
+  mutate(Minute = case_when(
+    TR >= 0 & TR < 2.1 ~ 'section_1',
+    TR >= 2.1 & TR < 3 ~ 'peak_1',
+    TR >= 3 & TR < 5.01 ~ 'section_2',
+    TR >= 5.01 & TR < 5.9 ~ 'peak_2',
+    TR >= 5.9 & TR < 6.9 ~ 'peak_3',
+    TR >= 6.9 & TR < 8 ~ 'section_3',
+    TR >= 8 & TR < 9 ~ 'peak_4',
+    TR >= 9 & TR < 10 ~ 'section_4',
+    TRUE ~ 'Unknown'
+  )) %>% 
+  group_by(lot, Sample,Minute) %>% 
+  summarise(area_peak = sum(Abs * (TR[2]-TR[1]), na.rm = T), .groups = 'drop') %>% 
+  pivot_wider(names_from = Minute, values_from = area_peak, names_prefix = 'Area_') %>% 
+  select(-Area_Unknown, -Area_section_1,-Area_section_2,-Area_section_3,-Area_section_4)
+
+spectrum_acp
+```
+
+
+# Aeras by peck, batch and Sample
+
+The area under the curve of each signal is shown in the graph below for each sample and each batch. This allows us to visualize how the intensity of each signal varies in a general way among batches, using a bar plot and organized by peaks.
+
+
+```{r fig.height=6, fig.width=10}
+p4 <- spectrum_acp %>% 
+  gather(key = 'Area', value = 'value', 3:6) %>% 
+  ggplot(aes(x = Sample, y = value, colour = lot, fill = lot)) +
+  geom_bar(stat = 'identity',position="dodge") +
+  facet_wrap(~Area, scales = "free_x") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0)) +
+  theme(legend.position = "none", panel.spacing.y = unit(3, "cm"))
+  
+ggplotly(p4)
+```
+
+
+# PCA Assumptions 
+
+```{r}
+
+# Bartlett test
+print('########## Prueba de Bartlett')
+spectrum_acp %>% 
+  select(-lot, -Sample) %>% 
+  scale(center = T, scale = T) %>% 
+  cortest.bartlett(n = 30)
+
+print('########## KMO (Kaiser-Meyer-Olkin) test')
+# KMO (Kaiser-Meyer-Olkin) test
+spectrum_acp %>% 
+  select(-lot, -Sample) %>% 
+  scale(center = T, scale = T) %>% 
+  cor() %>% 
+  KMO()
+
+print('########## Determinant test')
+# Determinant test
+spectrum_acp %>% 
+  select(-lot, -Sample) %>% 
+  scale(center = T, scale = T) %>% 
+  cor() %>% 
+  det()
+```
+
+
+Before applying Principal Component Analysis (PCA), we verified whether the data structure justified dimensionality reduction:
+
+Bartlett’s Test
+Indicates whether variables are sufficiently correlated.
+• Chi-squared = 356.23
+• p-value = 7.08e-74
+Interpretation: Variables show significant correlations. PCA is justified.
+
+KMO Index
+Measures sampling adequacy.
+• Overall KMO = 0.75
+• All variables between 0.65 and 0.99
+Interpretation: The structure is adequate for PCA.
+
+Determinant of the Correlation Matrix
+• Value = 8.2e-08
+Interpretation: High multicollinearity. Dimensionality reduction is appropriate.
+
+Conclusion:
+The results confirm that PCA is appropriate for this dataset. The variables are correlated and share enough structure to be summarized by components.
+
+
+# Perform the NIPALS ACP algorithm
+
+After confirming the PCA assumptions, I decided to code my own PCA function, called niplasJDM(), to control each step of the analysis. This approach allows full transparency throughout the process, enabling a better understanding of the data's behavior and the flexibility to adapt the analysis to specific project needs.
+
+
+
+```{r}
+nipalsJDM <- function(df, n_comp, scale = F){
+  # Mean centering
+  X <- scale(df, center = T, scale = scale)
+  
+  #total variance, compute covariance
+  SStot <- sum(X^2)
+  # Prepare matrixes for soceres, loadings
+  scores <- matrix(0, nrow = nrow(X), ncol = n_comp)
+  loads <- matrix(0, nrow = ncol(X), ncol = n_comp)
+  expvar <- rep(0, n_comp) # explained variance
+  resvar <- rep(0, n_comp)# Residuals variace
+  acumvar <- rep(0, n_comp) # Acumulated variance
+  for(a in 1:n_comp){
+    # Initialization
+    col.ind <- which.max(apply(X = X, MARGIN = 2, FUN = sd))
+    t <- X[,col.ind, drop = F]
+    for(i in 1:30){
+      # compute the loadings
+      p <- crossprod(X,t)
+      p <- p/sqrt(sum(p^2))
+      # Compute scores
+      t <- X%*%p
+    }
+    scores[,a] <- t
+    loads[,a] <- p
+    tpt <- tcrossprod(t,p)
+    X <-  X - tpt 
+    
+    expvar[a] <- sum(tpt^2) / SStot
+  }
+  resvar <- 1 - expvar
+  acumvar <- cumsum(expvar)
+  colnames(scores) <- colnames(loads) <- paste0("PC", 1:n_comp)
+  rownames(scores) <- rownames(df)
+  rownames(loads) <- colnames(df)
+  
+  names(expvar) <- names(resvar) <- names(acumvar) <- paste0("PC", 1:n_comp)
+  return(list(scores = scores, loads = loads, expvar = expvar, resvar = resvar, acumvar = acumvar))
+}
+
+```
+
+What does the function do?
+Centers (and optionally scales) the data.
+Computes the scores (the new coordinates of the samples on each component).
+Computes the loadings (how strongly the original variables relate to each component).
+Estimates the variance explained by each component.
+Calculates the residual variance (what the model does not explain).                  Computes the cumulative variance.
+
+
+With my nipalsJDM function ready, I applied PCA to the area data. First, I converted the table to a data.frame, set the sample names as row identifiers, removed the batch column (since it is not numerical), and scaled the variables because the area values were in different magnitudes. I selected three principal components, which were enough to capture most of the information without making the model too complex.
+
+
+```{r}
+acp_spec <- spectrum_acp %>% 
+  as.data.frame() %>% 
+  tibble::column_to_rownames(var = 'Sample') %>% 
+  select(-lot) %>% 
+  nipalsJDM(n_comp = 3, scale = T) 
+
+acp_spec
+```
+
+# PCA GRAPHICS
+
+Before plotting the PCA results, I prepared some variables to make the visualization easier. First, I converted the batch column into a factor, so I could assign each one a different color and shape automatically. I used the rainbow() palette for colors and selected different symbols (pch) to identify each batch clearly. I also created a positions variable to place the variable names when plotting loadings, and calculated a proportional scale to show both scores and loadings on the same plot without distortion.
+
+```{r fig.height=8, fig.width=15}
+
+# Create a factor with the batches
+lots <- factor(spectrum_acp$lot)
+# Automatically assign colors to each batch
+color_lots <- rainbow(n = 6)
+color <- color_lots[as.numeric(lots)]
+
+pch_lots <- c(16, 17, 15, 18, 19, 20)  # Change if you want others
+# Take the batches in the correct order
+lots <- factor(spectrum_acp$lot)  # already ordered by the PCA samples
+# Assign pch according to batch
+pchs <- pch_lots[as.numeric(lots)]
+
+positions <- rep(1:4, length.out = nrow(acp_spec$scores))
+escala <- max(abs(acp_spec$scores)) / max(abs(acp_spec$loads))
+plot(acp_spec$scores[,1], acp_spec$scores[,2], 
+     xlab = paste0('PC1 ',round(acp_spec$expvar[1]*100,2),'%'),
+     ylab = paste0('PC2 ', round(acp_spec$expvar[2]*100,2), '%'), 
+     col = color, main = "PCA - Scores + Loadings \n", col.main="black",
+     sub = paste0('Variance explained: ',round((acp_spec$expvar[1]*100) + (acp_spec$expvar[2]*100),2), '%'),
+     col.sub="black",
+     xlim = c(-2.5,2.5), ylim = c(-2.5,2.5), pch = pchs)
+
+text(acp_spec$scores[,1], acp_spec$scores[,2], labels = rownames(acp_spec$scores), cex = 0.5, pos = positions, offset = 0.3)
+
+arrows(x0 = 0,y0 = 0, x1 = acp_spec$loads[,1]*escala, y1 = acp_spec$loads[,2]*escala, col = "red", length =0.1)
+text(acp_spec$loads[,1]*escala,  acp_spec$loads[,2]*escala, labels = rownames(acp_spec$loads), cex = 0.6, col = 'red',  
+     pos = positions, offset = 0.3)
+
+legend('topright', legend = levels(lots), col = color_lots[1:length(levels(lots))],
+      pch =  pch_lots[1:length(levels(lots))], title = 'Lots', cex = 0.6)
+
+```
+
+```{r fig.height=6, fig.width=10}
+# 2D plot
+# Getting batches, colors, pch factors
+batches <- factor(spectrum_acp$lot)
+colors_batch <- rainbow(n = length(unique(batches)))
+colorize_batch <- colors_batch[as.numeric(batches)]
+
+pch <- seq(1,length(unique(batches)))
+pch_batches <- pch[as.numeric(batches)]
+positions <- rep(1:4, length = nrow(acp_spec$scores))
+scale_loadings <- max(abs(acp_spec$scores))/max(abs(acp_spec$loads))
+
+df_scores <- acp_spec$scores %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var = 'Sample')
+df_scores$Color <- colorize_batch
+df_scores$PCH <- pch_batches
+df_scores$batches <- batches
+
+p5 <- plot_ly(data = df_scores, x = ~PC1, y = ~PC2,
+        text = ~Sample, color = ~batches,
+        colors = ~colorize_batch,
+        type = 'scatter', mode = "markers+text",
+        marker = list(symbol = ~pch_batches, size = 10),
+        textposition = 'topright'
+) %>% 
+  layout(
+    title = list(text = "PCA - Scores + Loadings", font = list(color = "gray40")),
+    xaxis = list(title = paste0('PC1 (', round(acp_spec$expvar[1] * 100, 2), '%)')),
+    yaxis = list(title = paste0('PC2 (', round(acp_spec$expvar[2] * 100, 2), '%)')),
+    legend = list(title = list(text = "Lotes")),
+    margin = list(t = 60)
+  ) 
+
+# adding loadings' arros
+
+loadings <- as.data.frame(acp_spec$loads * scale_loadings ) %>% 
+  rownames_to_column(var = 'Variable')
+p5 <- p5 %>% 
+  add_segments(
+    data = loadings,
+    x = 0, y = 0,
+    xend = ~PC1, yend = ~PC2,
+    line = list(color = 'red4'),
+    inherit = F
+  ) %>% 
+  add_text(
+    data = loadings,
+    x = ~PC1, y = ~PC2,
+    text = ~Variable,
+    textposition = "top right",
+    textfont = list(color = 'red',size =10),
+    inherit = F
+  )
+
+# 3D plot
+df_scores <- as.data.frame(acp_spec$scores)
+df_scores$Sample <- rownames(acp_spec$scores)
+df_scores$Color <- color
+df_scores$PCH <- pchs
+df_scores$Lote <- lots
+
+
+fig <- plot_ly(data = df_scores, x = ~PC1, y = ~PC2, z = ~PC3, type = 'scatter3d',
+                 text = ~Sample, color = ~Lote, colors = color_lots,  
+               mode = "markers", marker = list(size = 5), textposition = "top right")
+
+loadings <- as.data.frame(acp_spec$loads)
+loadings$Variable <- rownames(acp_spec$loads)
+
+for (i in rownames(loadings)) {
+  fig <- fig %>% add_trace(
+    data = NULL,
+    x = c(0, loadings[i, 'PC1'] * scale_loadings),
+    y = c(0, loadings[i, 'PC2'] * scale_loadings),
+    z = c(0, loadings[i, 'PC3'] * scale_loadings),
+    type = 'scatter3d',
+    mode = "lines+text",
+    line = list(color = 'gray20', width = 2),
+    text = i,
+    name = i,
+    showlegend = T,
+    color = I("gray20"),  
+    inherit = FALSE 
+  )
+}
+
+fig <- fig %>% layout(
+  scene = list(
+    xaxis = list(showgrid = FALSE),
+    yaxis = list(showgrid = FALSE),
+    zaxis = list(showgrid = FALSE),
+    dragmode = "turntable"
+  )
+)
+
+
+p5
+fig
+
+```
+
+
+After calculating the PCA, I used different types of plots to make the results easier to interpret:
+•	2D plot (Base R): I used a basic 2D plot to show the samples projected on PC1 and PC2. Points are colored and shaped by batch. Red arrows show the loadings (the direction and importance of each variable). This helps to see how samples group and which variables are influencing the separation.
+•	Interactive 2D plot (Plotly): I created a dynamic version with Plotly and ggplot2. It lets you interact with the points, see sample names, highlight batches, and understand variable directions. This is useful when there are many samples.
+•	3D plot (Plotly): Finally, I made a 3D plot showing the first three principal components. It helps to better understand the full structure of the data. I also added the loadings in 3D to see how each variable contributes to the components.
+
+
+# Example of PCA interpretation from UV spectral data
+
+```{r fig.height=6, fig.width=10}
+acp_spec$loads %>%
+  as.data.frame() %>% 
+  rownames_to_column(var = 'Area_Peak') %>% 
+  gather(key = 'PC', value = 'Area', 2:4) %>% 
+  ggplot(aes(x = Area_Peak, y = Area, colour = Area_Peak, fill = Area_Peak)) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  geom_text(aes(label = round(Area,2)), colour = 'black',
+            position = position_dodge(width = 0.9),
+            hjust =0, vjust = -0.5, size = 4.5, angle = 0) +
+  facet_wrap(~PC,  scales = "free_x") +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0)) +
+  theme(legend.position = "none")
+```
+
+
+In this PCA example, Principal Component 1 (PC1) shows that all peaks increase together. This suggests that PC1 represents a general concentration trend — samples with higher PC1 values have higher amounts of all compounds. In a lab or production setting, this could help identify batches with overall high concentration, which may indicate overdosed or enriched formulations.
+
+Principal Component 2 (PC2) shows an opposite trend: when one specific peak (e.g., peak 3) increases, the others decrease. This means some ingredients replace others. If peak 3 represents an expensive UV filter, this could show which samples belong to a premium product line. It can also help detect mistakes in cheaper formulations.
+
+Principal Component 3 (PC3) shows a conflict between two peaks: when one goes up, the other goes down. This may suggest that two ingredients are not used together — maybe one is natural and the other synthetic. This type of information is useful to improve formulations, reduce costs, or make the product more stable and sustainable.
+
+# Example of ANOVA applied to PCA results:
+
+To explore whether differences exist between production batches, we analyzed PC1 values by lot using ANOVA. First, we checked the assumptions for a classical (parametric) ANOVA. The residuals from the linear model (PC1 ~ Lot) were not normally distributed (Shapiro-Wilk p < 0.05), and several outliers appeared in lots A, B, and E. However, Levene’s test confirmed equal variances (p > 0.05).
+
+```{r}
+library(ggstats)
+library(rstatix)
+library(ggstatsplot)
+library(ggpubr)
+
+# Outliers
+df_scores %>% 
+  select(Sample, Lote, PC1) %>% 
+  group_by(Lote) %>% 
+  identify_outliers(PC1)
+
+# Normality
+fit <- lm(PC1 ~ Lote, data = df_scores)
+shapiro_test(residuals(fit)) # p-value < 0.05, the residuals are not normally distributed
+ggqqplot(residuals(fit))
+
+# Variance homogeneity
+plot(fit, 1)
+df_scores %>% 
+  levene_test(PC1 ~ Lote) # p > 0.05, we cannot reject variance homogeneity
+
+```
+
+Even after applying a 20% trimmed robust ANOVA, normality wasn't achieved. So, a non-parametric ANOVA was used instead — better suited when normality assumptions are violated.
+
+```{r fig.height=6, fig.width=10}
+# Non-parametric tests
+df_scores %>% 
+  kruskal_test(PC1 ~ Lote) # the distribution across lots is not the same
+
+# Effect size
+df_scores %>% 
+  kruskal_effsize(PC1 ~ Lote) # significant effect size
+
+# Post hoc tests
+df_scores %>% 
+  dunn_test(PC1 ~ Lote, p.adjust.method = 'bonferroni')
+
+ggbetweenstats(data = df_scores, x = Lote, y = PC1, type = 'np',
+               bf.message = F, p.adjust.method = 'bonferroni')
+```
+
+
+The analysis revealed that lots B and E have significantly different PC1 values compared to the others. This suggests that their chemical profile differs, possibly due to changes in formulation or processing. Other lots showed similar patterns, indicating consistent production, while B and E deviate from the expected profile.
+
+Conclusion:
+
+This example shows how chemometrics can turn complex data like UV spectra into actionable insights. By detecting differences between batches without additional chemical tests, companies can improve quality control, save reagents, and make faster decisions. This enhances efficiency, reduces costs and time, and ultimately strengthens product quality and production reliability.
+
+
+
+
+
+
+
+
+
